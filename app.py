@@ -8,6 +8,19 @@ from pathlib import Path
 from datetime import date
 from functools import lru_cache
 import re
+import numpy as np
+
+# ==============================================================
+# Shared box style (ensures equal widths + alignment)
+# ==============================================================
+BOX = {
+    "border": "2px dashed #cfcfcf",
+    "borderRadius": "14px",
+    "padding": "12px",
+    "background": "white",
+    "width": "100%",
+    "boxSizing": "border-box",
+}
 
 # ==============================================================
 # Player database (bio cards under each search)
@@ -16,14 +29,16 @@ DB_LOCAL = Path("ATP_Database.csv")
 DB_MOUNT = Path("/mnt/data/ATP_Database.csv")
 CSV_PATH_PLAYERS = DB_LOCAL if DB_LOCAL.exists() else DB_MOUNT
 
-df_players = pd.read_csv(CSV_PATH_PLAYERS, encoding="latin1")
-df_players.columns = df_players.columns.str.strip().str.lower()
-
-cols_keep = [
+PLAYERS_USECOLS = {
     "id", "player", "atpname", "birthdate", "weight", "height",
     "turnedpro", "birthplace", "coaches", "hand", "backhand", "ioc"
-]
-df_players = df_players[[c for c in cols_keep if c in df_players.columns]]
+}
+df_players = pd.read_csv(
+    CSV_PATH_PLAYERS,
+    encoding="latin1",
+    usecols=lambda c: c.strip().lower() in {x.lower() for x in PLAYERS_USECOLS}
+)
+df_players.columns = df_players.columns.str.strip().str.lower()
 
 def pick_display_name(row):
     a = str(row.get("atpname", "")).strip()
@@ -113,7 +128,7 @@ def card_from_row(row):
                 },
             ),
         ],
-        style={"border": "1px dashed #cfcfcf", "borderRadius": "14px", "padding": "12px", "background": "white"}
+        style=BOX  # <- equal width with radar blocks
     )
 
 def find_player_row_by_name(name: str):
@@ -135,7 +150,7 @@ def find_player_row_by_name(name: str):
 SURF_MAP = {"grass": "Grass", "clay": "Clay", "hard": "Hard court", "hard court": "Hard court"}
 SURF_ORDER = ["Grass", "Clay", "Hard court"]
 
-# --- Show ATP 250 and ATP 500 as separate spokes
+# Expose ATP 250 and ATP 500 separately
 PREFERRED_TIERS = ["ATP 250", "ATP 500", "Masters 1000", "Grand Slams", "ATP Finals"]
 TIER_SHORT = {
     "ATP 250": "ATP 250",
@@ -159,57 +174,31 @@ def _load_tier_map() -> pd.DataFrame:
             dfm = pd.read_csv(p)
             dfm["pattern"] = dfm["pattern"].astype(str).str.strip().str.lower()
             dfm["category"] = dfm["category"].astype(str).str.strip()
-            # Prioritise ATP 500 in case of overlaps
+            # Prioritize 500 for overlaps
             dfm["__order"] = dfm["category"].map({"ATP 500": 0, "ATP 250": 1}).fillna(2)
             return dfm.sort_values(["__order"]).drop(columns="__order")
-    # Fallback: empty map (we'll default unknown A to ATP 250, see map_tier)
     return pd.DataFrame(columns=["pattern", "category"])
 
 TIER_MAP_DF = _load_tier_map()
 
-def resolve_a_subtier(tourney_name: str) -> str | None:
-    """Return 'ATP 250' or 'ATP 500' for A-level using substring patterns from CSV; None if unknown."""
-    if TIER_MAP_DF.empty:
+def _compile_regex_from_map(df_map: pd.DataFrame, cat: str):
+    pats = df_map.loc[df_map["category"] == cat, "pattern"].dropna().unique().tolist()
+    if not pats:
         return None
-    name = str(tourney_name or "").lower()
-    if not name:
-        return None
-    # First match wins (ATP 500 rows were sorted first)
-    m = TIER_MAP_DF[TIER_MAP_DF["pattern"].apply(lambda pat: pat in name)]
-    if not m.empty:
-        return m.iloc[0]["category"]
-    return None
+    pats = [re.escape(p) for p in pats if p]
+    return re.compile("|".join(pats))
 
-def map_tier(row):
-    """
-    Normalize tournament level:
-      G -> Grand Slams
-      M/F -> Masters 1000 (except Finals detection)
-      A -> ATP 250 / ATP 500 (via CSV-based resolver; defaults to ATP 250 if unknown)
-    """
-    lvl = str(row.get("tourney_level", "")).strip().upper()
-    if lvl == "G":
-        return "Grand Slams"
-    if lvl in {"M", "F"}:
-        # Disambiguate ATP Finals by draw size or name
-        dsize = row.get("draw_size")
-        tname = str(row.get("tourney_name", "")).lower()
-        try:
-            if pd.notna(dsize) and int(dsize) == 8:
-                return "ATP Finals"
-        except Exception:
-            pass
-        if "finals" in tname:
-            return "ATP Finals"
-        return "Masters 1000"
-    if lvl == "A":
-        sub = resolve_a_subtier(row.get("tourney_name"))
-        # Choose a sensible default for unknown "A" events:
-        return sub if sub in {"ATP 250", "ATP 500"} else "ATP 250"   # <- change to "ATP 250/500" if you prefer neutral
-    return None
+RE_500 = _compile_regex_from_map(TIER_MAP_DF, "ATP 500")
+RE_250 = _compile_regex_from_map(TIER_MAP_DF, "ATP 250")
+
+# --------- Data loading & normalization (vectorized)
+READ_USECOLS = [
+    "winner_name", "loser_name", "surface", "tourney_level",
+    "tourney_name", "draw_size"
+]
 
 def _read_one_csv(path: Path, year_hint: int | None) -> pd.DataFrame:
-    df_ = pd.read_csv(path)
+    df_ = pd.read_csv(path, usecols=lambda c: c.strip().lower() in {x.lower() for x in READ_USECOLS})
     df_.columns = df_.columns.str.strip()
     lower_map = {c.lower(): c for c in df_.columns}
 
@@ -224,21 +213,15 @@ def _read_one_csv(path: Path, year_hint: int | None) -> pd.DataFrame:
         "tourney_name": ["tournament", "tourney", "tournament_name", "tourney name", "event"],
         "draw_size": ["draw_size", "draw size", "draw", "size"]
     }
-
-    # map required columns by alias
     for need in list(req):
         if need not in lower_map:
             for cand in alias.get(need, []):
                 if cand in lower_map:
                     lower_map[need] = lower_map[cand]
                     break
-
     if any(k not in lower_map for k in ["winner_name", "loser_name", "surface", "tourney_level"]):
-        return pd.DataFrame(columns=[
-            "winner_name","loser_name","surface","tourney_level","tourney_name","draw_size","source_year"
-        ])
+        return pd.DataFrame(columns=[*req, "tourney_name", "draw_size", "source_year"])
 
-    # optional columns
     tname_col = lower_map.get("tourney_name")
     if not tname_col:
         for cand in opt["tourney_name"]:
@@ -250,32 +233,31 @@ def _read_one_csv(path: Path, year_hint: int | None) -> pd.DataFrame:
             if cand in lower_map:
                 dsize_col = lower_map[cand]; break
 
-    df_std = pd.DataFrame({
+    year = year_hint
+    if year is None:
+        m = re.search(r"(\d{4})", str(path.name))
+        if m: year = int(m.group(1))
+
+    out = pd.DataFrame({
         "winner_name": df_[lower_map["winner_name"]].astype(str),
         "loser_name":  df_[lower_map["loser_name"]].astype(str),
         "surface":     df_[lower_map["surface"]].astype(str),
         "tourney_level": df_[lower_map["tourney_level"]].astype(str),
-        "tourney_name": df_[tname_col].astype(str) if tname_col else "",
+        "tourney_name": (df_[tname_col].astype(str) if tname_col else ""),
         "draw_size": pd.to_numeric(df_[dsize_col], errors="coerce").astype("Int64") if dsize_col else pd.Series([pd.NA]*len(df_)).astype("Int64"),
+        "source_year": year,
     })
-    year = year_hint
-    if year is None:
-        m = re.search(r"(\d{4})", str(path.name))
-        if m:
-            year = int(m.group(1))
-    df_std["source_year"] = year
-    return df_std
+    return out
 
 @lru_cache(maxsize=1)
 def load_years(start: int = 2000, end: int = 2025) -> pd.DataFrame:
     paths = []
     for y in range(start, end + 1):
-        local = Path(f"{y}.csv")
-        mount = Path(f"/mnt/data/{y}.csv")
-        if local.exists():
-            paths.append((local, y))
-        elif mount.exists():
-            paths.append((mount, y))
+        p = Path(f"{y}.csv")
+        if not p.exists():
+            p = Path(f"/mnt/data/{y}.csv")
+        if p.exists():
+            paths.append((p, y))
     if not paths:
         raise FileNotFoundError("Ingen årsfiler fundet (2000–2025).")
 
@@ -285,13 +267,63 @@ def load_years(start: int = 2000, end: int = 2025) -> pd.DataFrame:
             frames.append(_read_one_csv(p, y))
         except Exception:
             continue
-    df_all = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(
-        columns=["winner_name","loser_name","surface","tourney_level","tourney_name","draw_size","source_year"]
-    )
-    df_all["surface"] = df_all["surface"].str.strip().str.lower()
+
+    if not frames:
+        return pd.DataFrame(columns=READ_USECOLS + ["source_year"])
+
+    df_all = pd.concat(frames, ignore_index=True)
+
+    # normalization (vectorized)
     df_all["tourney_level"] = df_all["tourney_level"].str.strip().str.upper()
-    df_all["tourney_name"] = df_all["tourney_name"].fillna("").astype(str)
-    df_all = df_all[df_all["winner_name"].notna() & df_all["loser_name"].notna()]
+    df_all["surface_norm"] = df_all["surface"].str.strip().str.lower()
+    df_all["surface_label"] = df_all["surface_norm"].map(SURF_MAP).fillna("Other")
+    df_all["tname_norm"] = df_all["tourney_name"].fillna("").astype(str).str.lower()
+
+    # vectorized tier mapping
+    lvl = df_all["tourney_level"].to_numpy()
+    tname = df_all["tname_norm"].to_numpy()
+    tier = np.full(len(df_all), "", dtype=object)
+
+    # Slams
+    mask_G = (lvl == "G")
+    tier[mask_G] = "Grand Slams"
+
+    # Masters vs Finals
+    mask_MF = (lvl == "M") | (lvl == "F")
+    finals_by_name = np.char.find(tname.astype(str), "finals") >= 0
+    tier[mask_MF & ~finals_by_name] = "Masters 1000"
+    tier[mask_MF & finals_by_name] = "ATP Finals"
+
+    # A level -> 250/500 via regex
+    mask_A = (lvl == "A")
+    a_idx = np.where(mask_A)[0]
+    if len(a_idx):
+        sub = np.full(len(a_idx), "", dtype=object)
+        subnames = tname[a_idx]
+        if RE_500 is not None:
+            sub[np.fromiter((bool(RE_500.search(s)) for s in subnames), dtype=bool, count=len(subnames))] = "ATP 500"
+        if RE_250 is not None:
+            empty = (sub == "")
+            hits_250 = np.fromiter((bool(RE_250.search(s)) for s in subnames), dtype=bool, count=len(subnames))
+            sub[empty & hits_250] = "ATP 250"
+        sub[sub == ""] = "ATP 250"  # default for unknown A
+        tier[a_idx] = sub
+
+    df_all["tier"] = pd.Categorical(tier, categories=PREFERRED_TIERS, ordered=True)
+
+    # keep only necessary columns downstream
+    df_all = df_all.loc[
+        (df_all["winner_name"].notna()) & (df_all["loser_name"].notna()),
+        ["winner_name","loser_name","surface_label","tier","source_year"]
+    ]
+
+    # restrict to known surfaces early
+    df_all = df_all[df_all["surface_label"].isin(SURF_ORDER)]
+
+    # categoricals for perf
+    df_all["surface_label"] = pd.Categorical(df_all["surface_label"], categories=SURF_ORDER, ordered=True)
+    df_all["source_year"] = df_all["source_year"].astype("int16")
+
     return df_all
 
 df = load_years(2000, 2025)
@@ -303,11 +335,11 @@ YEAR_MAX = int(df["source_year"].max()) if not df.empty else 2025
 # ==============================================================
 def _style_radar(fig, theta_labels):
     short = [TIER_SHORT.get(t, t) for t in theta_labels]
-    fig.update_traces(hoverinfo="skip", fill="toself", opacity=0.38, line=dict(width=2.4), marker=dict(size=4))
+    fig.update_traces(hoverinfo="skip", fill="toself", opacity=0.38, line=dict(width=2.2), marker=dict(size=3.5))
     fig.update_layout(
         height=450, paper_bgcolor="white", plot_bgcolor="white",
-        margin=dict(t=60, l=85, r=85, b=80), showlegend=True,
-        legend=dict(orientation="h", y=-0.10, yanchor="top", x=0.5, xanchor="center", font=dict(size=11)),
+        margin=dict(t=60, l=72, r=72, b=64), showlegend=True,
+        legend=dict(orientation="h", y=-0.08, yanchor="top", x=0.5, xanchor="center", font=dict(size=11)),
         title=dict(y=0.98)
     )
     try:
@@ -315,24 +347,24 @@ def _style_radar(fig, theta_labels):
             radialaxis=dict(range=[0, 1], dtick=0.2, gridcolor="#ececec", tickfont=dict(size=11), angle=90),
             angularaxis=dict(tickmode="array", tickvals=theta_labels, ticktext=short,
                              tickfont=dict(size=12), rotation=90, direction="clockwise",
-                             tickpadding=10, ticklen=6),
+                             tickpadding=8, ticklen=5),
         )
     except Exception:
         pass
     return fig
 
 def style_overlay_radar(fig):
-    fig.update_traces(fill="toself", opacity=0.38, line=dict(width=2.4), marker=dict(size=4), hoverinfo="skip")
+    fig.update_traces(fill="toself", opacity=0.38, line=dict(width=2.2), marker=dict(size=3.5), hoverinfo="skip")
     fig.update_layout(
         height=430, paper_bgcolor="white", plot_bgcolor="white",
-        margin=dict(t=56, l=64, r=64, b=80), showlegend=True,
-        legend=dict(orientation="h", y=-0.12, yanchor="top", x=0.5, xanchor="center", font=dict(size=11)),
-        title=dict(y=0.97)
+        margin=dict(t=52, l=56, r=56, b=64), showlegend=True,
+        legend=dict(orientation="h", y=-0.10, yanchor="top", x=0.5, xanchor="center", font=dict(size=11)),
+        title=dict(y=0.96)
     )
     try:
         fig.update_polars(
             radialaxis=dict(range=[0, 1], dtick=0.2, gridcolor="#ececec", tickfont=dict(size=11), angle=90),
-            angularaxis=dict(tickfont=dict(size=12), rotation=90, direction="clockwise", tickpadding=8, ticklen=6),
+            angularaxis=dict(tickfont=dict(size=12), rotation=90, direction="clockwise", tickpadding=6, ticklen=5),
         )
     except Exception:
         pass
@@ -345,57 +377,115 @@ def empty_radar_layout(_title_ignored: str):
     return _style_radar(fig, PREFERRED_TIERS)
 
 # ==============================================================
-# Helpers for stats
+# Helpers for stats (operate on pre-normalized df)
 # ==============================================================
+def _filter_years(dff: pd.DataFrame, years: tuple[int, int] | None):
+    if years:
+        y0, y1 = years
+        return dff[(dff["source_year"] >= y0) & (dff["source_year"] <= y1)]
+    return dff
+
 def all_players():
-    return sorted(pd.Index(df["winner_name"].dropna().astype(str)).union(df["loser_name"].dropna().astype(str)).unique().tolist())
+    return sorted(pd.Index(df["winner_name"].astype(str)).union(df["loser_name"].astype(str)).unique().tolist())
 
 ALL_PLAYERS = all_players()
 
-def player_surface_tier_wr(player_name: str) -> pd.DataFrame:
-    if df.empty:
+@lru_cache(maxsize=4096)
+def _player_surface_tier_wr_cached(player_name: str):
+    dff = df[(df["winner_name"] == player_name) | (df["loser_name"] == player_name)]
+    if dff.empty:
         return pd.DataFrame(columns=["surface_label","tier","win_rate","matches"])
-    dff = df[["winner_name","loser_name","surface","tourney_level","tourney_name","draw_size"]].copy()
-    dff["player_in_match"] = (dff["winner_name"].astype(str) == player_name) | (dff["loser_name"].astype(str) == player_name)
-    dff = dff[dff["player_in_match"]]
-    dff["tier"] = dff.apply(map_tier, axis=1); dff = dff[dff["tier"].notna()]
-    dff["surface_label"] = dff["surface"].astype(str).str.lower().map(SURF_MAP).fillna("Other")
-    dff = dff[dff["surface_label"].isin(SURF_ORDER)]
-    dff["is_win"] = (dff["winner_name"].astype(str) == player_name).astype(int)
-    g = dff.groupby(["surface_label","tier"], dropna=False)["is_win"].agg(wins="sum", matches="count").reset_index()
+    is_win = (dff["winner_name"] == player_name).astype("int8")
+    g = dff.assign(is_win=is_win).groupby(["surface_label","tier"], observed=True)["is_win"] \
+            .agg(wins="sum", matches="count").reset_index()
     g["win_rate"] = g["wins"] / g["matches"]
+    return g
+
+def player_surface_tier_wr(player_name: str) -> pd.DataFrame:
+    g = _player_surface_tier_wr_cached(player_name)
+    if g.empty:
+        return g
     return g[["surface_label","tier","win_rate","matches"]]
 
-def player_record(player, surface_label=None):
-    if df.empty: return 0, 0, 0.0
-    dff = df[["winner_name","loser_name","surface","tourney_level","tourney_name","draw_size"]].copy()
-    dff["tier"] = dff.apply(map_tier, axis=1); dff = dff[dff["tier"].notna()]
-    dff["surface_label"] = dff["surface"].astype(str).str.lower().map(SURF_MAP).fillna("Other")
-    dff = dff[dff["surface_label"].isin(SURF_ORDER)] if surface_label is None else dff[dff["surface_label"] == surface_label]
-    wins = int((dff["winner_name"].astype(str) == player).sum()); losses = int((dff["loser_name"].astype(str) == player).sum())
+@lru_cache(maxsize=4096)
+def _player_record_cached(player: str, surface_label: str | None):
+    dff = df if surface_label is None else df[df["surface_label"] == surface_label]
+    wins = int((dff["winner_name"] == player).sum())
+    losses = int((dff["loser_name"] == player).sum())
     pct = (wins / (wins + losses)) if (wins + losses) else 0.0
     return wins, losses, pct
 
-def head_to_head(a, b):
-    if df.empty: return 0, 0, 0.0
-    dff = df[["winner_name","loser_name"]].copy()
-    mask = ((dff["winner_name"] == a) & (dff["loser_name"] == b)) | ((dff["winner_name"] == b) & (dff["loser_name"] == a))
-    dff = dff[mask]
-    wins_a = int((dff["winner_name"] == a).sum()); wins_b = int((dff["winner_name"] == b).sum())
+def player_record(player, surface_label=None):
+    return _player_record_cached(player, surface_label)
+
+@lru_cache(maxsize=4096)
+def _h2h_cached(a: str, b: str):
+    dff = df[((df["winner_name"] == a) & (df["loser_name"] == b)) |
+             ((df["winner_name"] == b) & (df["loser_name"] == a))]
+    wins_a = int((dff["winner_name"] == a).sum())
+    wins_b = int((dff["winner_name"] == b).sum())
     pct_a = (wins_a / (wins_a + wins_b)) if (wins_a + wins_b) else 0.0
     return wins_a, wins_b, pct_a
 
+def head_to_head(a, b):
+    return _h2h_cached(a, b)
+
+@lru_cache(maxsize=4096)
+def _win_rate_by_tiers_cached(player: str, surface: str | None, years: tuple[int, int] | None):
+    dff = df
+    if years:
+        dff = _filter_years(dff, years)
+    if surface:
+        dff = dff[dff["surface_label"] == surface]
+    dff = dff[(dff["winner_name"] == player) | (dff["loser_name"] == player)]
+    if dff.empty:
+        return pd.DataFrame({"tier": TIERS_LONG, "win_rate": 0.0, "matches": 0})
+    is_win = (dff["winner_name"] == player).astype("int8")
+    g = dff.assign(is_win=is_win).groupby("tier", observed=True)["is_win"] \
+           .agg(wins="sum", matches="count").reindex(TIERS_LONG, fill_value=0).reset_index()
+    g["win_rate"] = np.divide(g["wins"], g["matches"], out=np.zeros_like(g["wins"], dtype=float), where=g["matches"]>0)
+    return g[["tier","win_rate","matches"]]
+
+def win_rate_by_tiers(player, surface=None, years: tuple[int, int] | None = None):
+    return _win_rate_by_tiers_cached(player, surface, years)
+
+@lru_cache(maxsize=4096)
+def _win_rate_by_surfaces_cached(player: str, tier: str | None, years: tuple[int, int] | None):
+    dff = df
+    if years:
+        dff = _filter_years(dff, years)
+    if tier:
+        dff = dff[dff["tier"] == tier]
+    dff = dff[(dff["winner_name"] == player) | (dff["loser_name"] == player)]
+    if dff.empty:
+        return pd.DataFrame({"surface_label": SURF_ORDER, "win_rate": 0.0, "matches": 0})
+    is_win = (dff["winner_name"] == player).astype("int8")
+    g = dff.assign(is_win=is_win).groupby("surface_label", observed=True)["is_win"] \
+           .agg(wins="sum", matches="count").reindex(SURF_ORDER, fill_value=0).reset_index()
+    g["win_rate"] = np.divide(g["wins"], g["matches"], out=np.zeros_like(g["wins"], dtype=float), where=g["matches"]>0)
+    return g[["surface_label","win_rate","matches"]]
+
+def win_rate_by_surfaces(player, tier=None, years: tuple[int, int] | None = None):
+    return _win_rate_by_surfaces_cached(player, tier, years)
+
+# ==============================================================
+# Head-to-head metric row (needed by H2H panel)
+# ==============================================================
 def metric_row(title, a_rec, b_rec, a_color=A_COLOR, b_color=B_COLOR):
-    a_w, a_l, a_pct = a_rec; b_w, b_l, b_pct = b_rec
+    a_w, a_l, a_pct = a_rec
+    b_w, b_l, b_pct = b_rec
     total = (a_pct or 0.0) + (b_pct or 0.0)
     frac_a = 0.5 if total == 0 else (a_pct or 0.0) / total
     split_pct = int(round(frac_a * 100))
-    a_pct_100 = int(round((a_pct or 0.0) * 100)); b_pct_100 = int(round((b_pct or 0.0) * 100))
+    a_pct_100 = int(round((a_pct or 0.0) * 100))
+    b_pct_100 = int(round((b_pct or 0.0) * 100))
 
     labels = html.Div(
-        [html.Div(f"{a_pct_100}%", style={"color": a_color, "fontWeight": 700, "fontSize": "12px"}),
-         html.Div(f"{b_pct_100}%", style={"color": b_color, "fontWeight": 700, "fontSize": "12px", "textAlign": "right"})],
-        style={"display": "flex", "justifyContent": "space-between", "marginBottom": "4px", "minWidth": "300px"}
+        [
+            html.Div(f"{a_pct_100}%", style={"color": a_color, "fontWeight": 700, "fontSize": "12px"}),
+            html.Div(f"{b_pct_100}%", style={"color": b_color, "fontWeight": 700, "fontSize": "12px", "textAlign": "right"}),
+        ],
+        style={"display": "flex", "justifyContent": "space-between", "marginBottom": "4px", "minWidth": "300px"},
     )
     pill_style = {
         "height": "16px", "width": "100%", "minWidth": "300px", "borderRadius": "999px",
@@ -413,65 +503,21 @@ def metric_row(title, a_rec, b_rec, a_color=A_COLOR, b_color=B_COLOR):
     ], style={"marginBottom": "18px"})
 
 # ==============================================================
-# NEW overlay comparison helpers (shared search inputs) + year filtering
+# UI pieces
 # ==============================================================
-def _filter_years(dff: pd.DataFrame, years: tuple[int, int] | None):
-    if years and "source_year" in dff.columns:
-        y0, y1 = years
-        return dff[(dff["source_year"] >= y0) & (dff["source_year"] <= y1)]
-    return dff
-
-def win_rate_by_tiers(player, surface=None, years: tuple[int, int] | None = None):
-    if df.empty:
-        return pd.DataFrame(columns=["tier", "win_rate", "matches"])
-    dff = df[["winner_name","loser_name","surface","tourney_level","tourney_name","draw_size","source_year"]].copy()
-    dff = _filter_years(dff, years)
-    dff["tier"] = dff.apply(map_tier, axis=1)
-    dff = dff[dff["tier"].isin(TIERS_LONG)]
-    dff["surface_label"] = dff["surface"].astype(str).str.lower().map(SURF_MAP).fillna("Other")
-    if surface and surface in SURF_ORDER:
-        dff = dff[dff["surface_label"] == surface]
-    else:
-        dff = dff[dff["surface_label"].isin(SURF_ORDER)]
-    dff = dff[(dff["winner_name"] == player) | (dff["loser_name"] == player)]
-    dff["is_win"] = (dff["winner_name"] == player).astype(int)
-    g = dff.groupby("tier", dropna=False)["is_win"].agg(wins="sum", matches="count").reset_index()
-    g["win_rate"] = g["wins"] / g["matches"]
-    return g.set_index("tier").reindex(TIERS_LONG).fillna(0).reset_index()[["tier","win_rate","matches"]]
-
-def win_rate_by_surfaces(player, tier=None, years: tuple[int, int] | None = None):
-    if df.empty:
-        return pd.DataFrame(columns=["surface_label", "win_rate", "matches"])
-    dff = df[["winner_name","loser_name","surface","tourney_level","tourney_name","draw_size","source_year"]].copy()
-    dff = _filter_years(dff, years)
-    dff["tier"] = dff.apply(map_tier, axis=1)
-    dff = dff[dff["tier"].isin(TIERS_LONG)]
-    dff["surface_label"] = dff["surface"].astype(str).str.lower().map(SURF_MAP).fillna("Other")
-    dff = dff[dff["surface_label"].isin(SURF_ORDER)]
-    if tier and tier in TIERS_LONG:
-        dff = dff[dff["tier"] == tier]
-    dff = dff[(dff["winner_name"] == player) | (dff["loser_name"] == player)]
-    dff["is_win"] = (dff["winner_name"] == player).astype(int)
-    g = dff.groupby("surface_label", dropna=False)["is_win"].agg(wins="sum", matches="count").reset_index()
-    g["win_rate"] = g["wins"] / g["matches"]
-    return g.set_index("surface_label").reindex(SURF_ORDER).fillna(0).reset_index()[["surface_label","win_rate","matches"]]
-
 def empty_overlay_radar():
     fig = go.Figure()
-    fig.add_trace(go.Scatterpolar(r=[0,0,0,0,0], theta=TIERS_TICK, mode="lines",
+    fig.add_trace(go.Scatterpolar(r=[0]*len(TIERS_TICK), theta=TIERS_TICK, mode="lines",
                                   line=dict(color="rgba(0,0,0,0)"), showlegend=False))
     return style_overlay_radar(fig)
 
-# ==============================================================
-# App & layout
-# ==============================================================
 app = dash.Dash(__name__)
 app.title = "ATP — H2H & Player Cards (2000–2025)"
 
 def radar_block(index, title_caption):
     return html.Div(
         [
-            html.Div(title_caption, style={"fontWeight": 700, "margin": "8px 0 6px 4px", "fontSize": "14px"}),
+            html.Div(title_caption, style={"fontWeight": 700, "margin": "4px 0 6px 4px", "fontSize": "14px"}),
             dcc.Graph(
                 id={"type": "radar_graph", "index": index},
                 figure=empty_radar_layout(""),
@@ -479,14 +525,7 @@ def radar_block(index, title_caption):
                 style={"height": "450px", "width": "100%"},
             ),
         ],
-        style={
-            "border": "1px dashed #cfcfcf",
-            "borderRadius": "14px",
-            "padding": "8px 12px",
-            "background": "white",
-            "marginTop": "12px",
-            "width": "100%",
-        },
+        style=BOX  # <- equal width with the player card
     )
 
 def _year_marks(start, end):
@@ -530,17 +569,14 @@ def overlay_card():
             ),
             dcc.Graph(id="overlay_radar", figure=empty_overlay_radar(), config={"displayModeBar": False}),
         ],
-        style={
-            "border": "2px dashed #bdbdbd", "borderRadius": "12px", "padding": "12px",
-            "background": "white"
-        }
+        style=BOX
     )
 
 app.layout = html.Div(
     style={
         "display": "grid",
         "gridTemplateColumns": "340px minmax(580px, 1fr) 340px",
-        "gap": "28px",
+        "gap": "28px",                 # equal gaps left|middle|right
         "justifyContent": "center",
         "maxWidth": "1320px",
         "margin": "32px auto",
@@ -550,44 +586,68 @@ app.layout = html.Div(
     children=[
         dcc.Store(id="selected_players", data={"a": None, "b": None}),
 
-        # Left
+        # Left column (grid so children share width & line up)
         html.Div(
             [
                 dcc.Dropdown(id={"type": "player_dd", "index": 0}, options=[], value=None, placeholder="Search player", clearable=True),
-                html.Div(id={"type": "player_card", "index": 0}, style={"marginTop": "12px", "flex": "0 0 auto"}),
+                html.Div(id={"type": "player_card", "index": 0}, style={"marginTop": "12px"}),
                 radar_block(0, "Overall performance by surface and tournament size"),
             ],
-            style={"display": "flex","flexDirection": "column","justifyContent": "space-between","gap": "12px","height": "100%","minHeight": "780px","width": "100%","boxSizing": "border-box"},
+            style={
+                "display": "grid",
+                "gridTemplateRows": "auto auto 1fr",
+                "alignItems": "start",
+                "gap": "12px",
+                "width": "100%",
+                "boxSizing": "border-box",
+            },
         ),
 
-        # Middle
+        # Middle column
         html.Div(
             [
                 overlay_card(),
                 html.Div(
                     id="h2h_panel",
                     style={
-                        "border": "2px dashed #bdbdbd","borderRadius": "12px","padding": "16px","background": "white",
-                        "minHeight": "420px","maxWidth": "600px","margin": "12px auto 0","boxSizing": "border-box","width": "100%",
+                        **BOX,
+                        "padding": "16px",
+                        "minHeight": "420px",
+                        "maxWidth": "600px",
+                        "margin": "12px auto 0",
                     },
                 ),
                 html.Div(
                     f"Data: {df['source_year'].min() if not df.empty else '—'}–{df['source_year'].max() if not df.empty else '—'} "
-                    f"({df['source_year'].nunique() if not df.empty else 0} år fundet)",
+                    f"({df['source_year'].nunique() if not df.empty else 0} years found)",
                     style={"color": "#555", "fontSize": "12px", "textAlign": "center", "marginTop": "4px"}
                 ),
             ],
-            style={"display": "flex","flexDirection": "column","alignItems": "center","justifyContent": "flex-start","gap": "12px","width": "100%","boxSizing": "border-box"},
+            style={
+                "display": "grid",
+                "gridTemplateRows": "auto auto auto",
+                "alignItems": "start",
+                "gap": "12px",
+                "width": "100%",
+                "boxSizing": "border-box",
+            },
         ),
 
-        # Right
+        # Right column (mirrors left)
         html.Div(
             [
                 dcc.Dropdown(id={"type": "player_dd", "index": 1}, options=[], value=None, placeholder="Search player", clearable=True),
-                html.Div(id={"type": "player_card", "index": 1}, style={"marginTop": "12px", "flex": "0 0 auto"}),
+                html.Div(id={"type": "player_card", "index": 1}, style={"marginTop": "12px"}),
                 radar_block(1, "Overall performance by surface and tournament size"),
             ],
-            style={"display": "flex","flexDirection": "column","justifyContent": "space-between","gap": "12px","height": "100%","minHeight": "780px","width": "100%","boxSizing": "border-box"},
+            style={
+                "display": "grid",
+                "gridTemplateRows": "auto auto 1fr",
+                "alignItems": "start",
+                "gap": "12px",
+                "width": "100%",
+                "boxSizing": "border-box",
+            },
         ),
     ],
 )
@@ -645,7 +705,7 @@ def update_radar(selected_player):
     data = player_surface_tier_wr(selected_player)
     if data.empty:
         return empty_radar_layout("")
-    data = data[data["matches"] > 0].copy()
+    data = data[data["matches"] > 0]
     if data.empty:
         return empty_radar_layout("")
     theta_order = [t for t in PREFERRED_TIERS if t in data["tier"].unique().tolist()]
@@ -682,7 +742,7 @@ def update_overlay(sel, surface_val, tier_val, years_range):
     tier_val    = None if (not tier_val or tier_val == "Any") else tier_val
     years = tuple(years_range) if years_range else None
 
-    # Decide axis mode
+    # Axis mode
     show_axes_as_tiers = True
     if surface_val is None and tier_val is not None:
         show_axes_as_tiers = False
@@ -746,7 +806,11 @@ def update_h2h(sel):
             html.Div(str(wins_a), style={"fontWeight": 800, "color": A_COLOR}),
             html.Div("VS", style={"fontWeight": 800, "opacity": 0.75}),
             html.Div(str(wins_b), style={"fontWeight": 800, "color": B_COLOR}),
-        ], style={"display": "flex", "justifyContent": "center", "gap": "12px", "marginTop": "-36px", "marginBottom": "4px"})
+        ], style={
+            "display": "flex", "justifyContent": "center", "gap": "12px",
+            "position": "relative", "top": "10px",   # move the "5 VS 4" line slightly lower
+            "marginBottom": "8px"
+        })
     ])
 
     rows = [

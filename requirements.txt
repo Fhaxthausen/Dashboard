@@ -1,7 +1,5 @@
-pip>=24.2
-wheel
-numpy==1.26.4
-pandas==2.2.2
-plotly==5.24.1
 dash==2.17.1
-gunicorn==22.0.0
+plotly==5.24.1
+pandas==2.2.2
+numpy==1.26.4
+gunicorn==21.2.0

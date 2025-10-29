@@ -513,6 +513,7 @@ def empty_overlay_radar():
 
 app = dash.Dash(__name__)
 app.title = "ATP — H2H & Player Cards (2000–2025)"
+server = app.server   # ← add this line
 
 def radar_block(index, title_caption):
     return html.Div(

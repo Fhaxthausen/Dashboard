@@ -288,11 +288,10 @@ def load_years(start: int = 2000, end: int = 2025) -> pd.DataFrame:
     mask_G = (lvl == "G")
     tier[mask_G] = "Grand Slams"
 
-    # Masters vs Finals
-    mask_MF = (lvl == "M") | (lvl == "F")
-    finals_by_name = np.char.find(tname.astype(str), "finals") >= 0
-    tier[mask_MF & ~finals_by_name] = "Masters 1000"
-    tier[mask_MF & finals_by_name] = "ATP Finals"
+    # Masters vs Finals — by level code
+    tier[lvl == "F"] = "ATP Finals"
+    tier[lvl == "M"] = "Masters 1000"
+
 
     # A level -> 250/500 via regex
     mask_A = (lvl == "A")
@@ -513,7 +512,6 @@ def empty_overlay_radar():
 
 app = dash.Dash(__name__)
 app.title = "ATP — H2H & Player Cards (2000–2025)"
-server = app.server   # ← add this line
 
 def radar_block(index, title_caption):
     return html.Div(
